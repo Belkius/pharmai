@@ -5,14 +5,14 @@ from pymilvus import RRFRanker
 
 from pymilvus.model.hybrid import MGTEEmbeddingFunction
 
-client = MilvusClient(host="localhost", port=1953, timeout=10)
-# client = MilvusClient("milvus_db.db")
+# client = MilvusClient(host="localhost", port=1953, timeout=10)
+client = MilvusClient("milvus_db.db")
 
 mgte_ef = MGTEEmbeddingFunction(
     model_name="Alibaba-NLP/gte-multilingual-base",
 )
 
-def query_hybrid_search(query: str):
+def query_hybrid_search(query: str, limit: int = 2):
     query_embeddings = mgte_ef([query])
 
     sparse_req = AnnSearchRequest(
@@ -23,7 +23,7 @@ def query_hybrid_search(query: str):
     )
 
     result = client.hybrid_search(
-        collection_name="hybrid_collection", reqs=[sparse_req, dense_req], ranker=RRFRanker(), limit=2, output_fields=["id"]
+        collection_name="hybrid_collection", reqs=[sparse_req, dense_req], ranker=RRFRanker(), limit=limit, output_fields=["text"]
     )
 
     return result
