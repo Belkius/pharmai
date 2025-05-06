@@ -8,7 +8,7 @@ def main():
 
     app = build_graph()
     # inputs = {"question": "Jakie są wskazania do stosowania leku w postaci kapsułki żelatynowej?"}
-    inputs = {"question": "Jakie hitler miał włosy?"}
+    inputs = {"question": "Jak"}
     for output in app.stream(inputs):
         for key, value in output.items():
             pprint(f"Finished running: {key}:")

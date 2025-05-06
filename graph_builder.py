@@ -340,7 +340,8 @@ def grade_generation_v_documents_and_question(state):
         print("Error parsing score:", score)
         grade = "yes"
     #when web search is used, the score is either non existant or empty
-    if grade == "":
+    if grade != "yes" and grade != "no":
+        print("Error parsing score:", score)
         grade = "yes"
     # grade = score['score']
 
