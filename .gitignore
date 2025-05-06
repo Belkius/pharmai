@@ -1,3 +1,10 @@
+# Ignored directories for medical characteristics
+**/charakterystyki_pdf/
+**/charakterystyki_md*/
+.chainlit/
+.idea/
+.vscode/
+secrets.json
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

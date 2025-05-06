@@ -1,5 +1,3 @@
-# graph_builder.py
-
 from langchain.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langchain_community.chat_models import ChatOllama
@@ -8,8 +6,8 @@ from langchain.schema import Document
 from typing_extensions import TypedDict
 from typing import List
 
-# Import your local vector DB utils
-from vector_db import query_hybrid_search, extract_ids, load_texts_from_ids
+# Import local vector DB utils
+from vector_db import query_hybrid_search, extract_ids, load_texts_from_ids, headers_extraction
 from langchain_community.tools import DuckDuckGoSearchResults
 
 ### --- STATE DEFINITION ---
@@ -30,41 +28,64 @@ def get_llm():
 # web_search_tool = DuckDuckGoSearchResults(region="pl-pl", max_results=3)
 web_search_tool = DuckDuckGoSearchResults()
 
+headers = """NAZWA PRODUKTU LECZNICZEGO, SKŁAD JAKOŚCIOWY I ILOŚCIOWY, POSTAĆ FARMACEUTYCZNA, SZCZEGÓŁOWE DANE KLINICZNE, WŁAŚCIWOŚCI FARMAKOLOGICZNE, DANE FARMACEUTYCZNE, PODMIOT ODPOWIEDZIALNY POSIADAJĄCY POZWOLENIE NA DOPUSZCZENIE DO OBROTU, NUMER POZWOLENIA NA DOPUSZCZENIE DO OBROTU, DATA WYDANIA PIERWSZEGO POZWOLENIA NA DOPUSZCZENIE DO OBROTU I DATA PRZEDŁUŻENIA POZWOLENIA, DATA ZATWIERDZENIA LUB CZĘŚCIOWEJ ZMIANY TEKSTU CHARAKTERYSTYKI PRODUKTU LECZNICZEGO"""
+
+
 ### --- CHAINS ---
 llm = get_llm()
 retrieval_grader = PromptTemplate(
-    template="""You are a grader assessing relevance 
-    of a retrieved document to a user question. If the document contains keywords related to the user question, 
-    grade it as relevant. It does not need to be a stringent test. The goal is to filter out erroneous retrievals. 
-    
-    Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question.
-    Provide the binary score as a JSON with a single key 'score' and no premable or explaination.
-     
-    Here is the retrieved document: 
+    template = """
+    You are evaluating whether a retrieved document is relevant to a user question.
+    If the document contains keywords or concepts related to the question, consider it relevant. 
+    This is a lenient filter meant to exclude clearly unrelated results.
+    Return a binary relevance score: 'yes' if relevant, 'no' if not.
+    Output only a JSON object with a single key 'score' and no additional text.
+
+    Retrieved document:
     {document}
-    
-    Here is the user question: 
+
+    User question:
     {question}
     """,
     input_variables=["question", "document"],
 ) | llm | JsonOutputParser()
 
+header_selector = PromptTemplate(
+    template="""
+    You are an assistant helping to identify which document sections are relevant to a user's medical question.
+    Given the question and the list of document headers, select only the headers that would be useful to answer the question.
+    Return a JSON object with a single key 'relevant_headers' and the value as a list of selected headers. 
+    Do not include any additional text.
+
+    Question:
+    {question}
+
+    Headers:
+    {headers}
+    """,
+    input_variables=["question", "headers"],
+) | llm | JsonOutputParser()
+
+
 rag_chain = PromptTemplate(
-    template="""You are an assistant for question-answering tasks. 
-    Use the following pieces of retrieved context to answer the question. If you don't know the answer, just say that you don't know. 
-    Use three sentences maximum and keep the answer concise:
-    Question: {question} 
-    Context: {context} 
-    Answer: 
+    template="""
+    You are an assistant specialized in answering questions about medicinal products.
+    Use the provided context to answer the question. If the answer is not found in the context, respond with "Unfortunatly, I don't know."
+    Keep your response quick and concise.
+
+    Question: {question}  
+    Context: {context}  
+    Answer:
     """,
     input_variables=["question", "document"],
 ) | llm | StrOutputParser()
 
 hallucination_grader = PromptTemplate(
-    template="""You are a grader assessing whether 
-    an answer is grounded in / supported by a set of facts. Give a binary score 'yes' or 'no' score to indicate 
-    whether the answer is grounded in / supported by a set of facts. Provide the binary score as a JSON with a 
-    single key 'score' and no preamble or explanation.
+    template="""
+    You are a grader evaluating whether an answer is grounded in a given set of facts.
+    Determine if the answer is supported by the provided information. 
+    Return a binary score: 'yes' if the answer is grounded in the facts, 'no' if it is not.
+    Output only a JSON object with a single key 'score' with a 'yes' or 'no' value and no additional text.
     
     Here are the facts:
     {documents} 
@@ -76,9 +97,10 @@ hallucination_grader = PromptTemplate(
 ) | llm | JsonOutputParser()
 
 answer_grader = PromptTemplate(
-    template="""You are a grader assessing whether an 
-    answer is useful to resolve a question. Give a binary score 'yes' or 'no' to indicate whether the answer is 
-    useful to resolve a question. Provide the binary score as a JSON with a single key 'score' and no preamble or explanation.
+    template="""
+    You are a grader evaluating whether an answer is useful in resolving a given question.
+    Return a binary score: 'yes' if the answer is helpful in addressing the question, 'no' if it is not.
+    Output only a JSON object with a single key 'score' and no additional text.
      
     Here is the answer:
     {generation} 
@@ -89,14 +111,16 @@ answer_grader = PromptTemplate(
 ) | llm | JsonOutputParser()
 
 question_router = PromptTemplate(
-    template="""You are an expert at routing a 
-    user question to a vectorstore or web search. Use the vectorstore for questions on medical products characteristics. 
-    You do not need to be stringent with the keywords in the question related to these topics. 
-    Otherwise, use web-search. Give a binary choice 'web_search' or 'vectorstore' based on the question. 
-    Return the a JSON with a single key 'datasource' and no premable or explaination. 
+    template="""
+    You are an expert at routing user questions to the appropriate data source: vectorstore or web search.
+    Use the vectorstore for questions about medicinal products, even if keywords are only loosely related.
+    For all other questions, choose web search.
+    Return a binary choice: 'vectorstore' or 'web_search'.
+    Output only a JSON object with a single key 'datasource' and no additional text.
     
     Question to route: 
-    {question}""",
+    {question}
+    """,
     input_variables=["question"],
 ) | llm | JsonOutputParser()
 
@@ -114,12 +138,26 @@ def retrieve(state):
     """
     print("---RETRIEVE---")
     question = state["question"]
+    relevant_headers = state.get("relevant_headers", [])
+
     # Retrieval
     docs = load_texts_from_ids(extract_ids(query_hybrid_search(question)))
     doc_txt = docs[next(iter(docs))]
-    doc_txt = doc_txt.split('\n')
-    documents = '\n'.join(doc_txt[:len(doc_txt)//5])
-    documents = [documents]
+
+    filtered_docs = headers_extraction(doc_txt, relevant_headers)
+
+    if not filtered_docs:
+        print("---WARNING: No sections matched headers. Using fallback excerpt.---")
+        fallback = '\n'.join(doc_txt.split('\n')[:len(doc_txt.split('\n'))//5])
+        documents = [fallback]
+    else:
+        documents = ['\n'.join(filtered_docs)]
+    print(f"Filtered documents: {documents}")
+
+    # without headers splitting
+    # doc_txt = doc_txt.split('\n')
+    # documents = '\n'.join(doc_txt[:len(doc_txt)//5])
+    # documents = [documents]
 
     return {"documents": documents, "question": question}
 
@@ -140,6 +178,23 @@ def generate(state):
     # RAG generation
     generation = rag_chain.invoke({"context": documents, "question": question})
     return {"documents": documents, "question": question, "generation": generation}
+
+def select_headers(state):
+    """
+    Determines which headers are relevant to the user's question.
+    
+    Args:
+        state (dict): The current graph state
+
+    Returns:
+        state (dict): Adds 'relevant_headers' to state
+    """
+    print("---SELECT HEADERS RELEVANT TO QUESTION---")
+    question = state["question"]
+    selected = header_selector.invoke({"question": question, "headers": headers})
+    relevant_headers = selected['relevant_headers']
+    print(f"Selected headers: {relevant_headers}")
+    return {"question": question, "relevant_headers": relevant_headers}
 
 def grade_documents(state):
     """
@@ -190,16 +245,17 @@ def web_search(state):
 
     print("---WEB SEARCH---")
     question = state["question"]
-    documents = state["documents"]
+    documents = state.get("documents", [])
 
     # Web search
     docs = web_search_tool.invoke({"query": question})
-    web_results = "\n".join([d["content"] for d in docs])
+    web_results = "\n".join(docs)
     web_results = Document(page_content=web_results)
     if documents is not None:
         documents.append(web_results)
     else:
         documents = [web_results]
+    documents = documents[:3]  # Limit to 3 documents
     return {"documents": documents, "question": question}
 
 def route_question(state):
@@ -228,6 +284,9 @@ def route_question(state):
         return "websearch"
     elif source['datasource'] == 'vectorstore':
         print("---ROUTE QUESTION TO RAG---")
+        return "vectorstore"
+    else:
+        print("---ROUTE DEFAULT FALLBACK TO VECTORSTORE---")
         return "vectorstore"
     
 def decide_to_generate(state):
@@ -272,9 +331,18 @@ def grade_generation_v_documents_and_question(state):
     question = state["question"]
     documents = state["documents"]
     generation = state["generation"]
-
+    
     score = hallucination_grader.invoke({"documents": documents, "generation": generation})
-    grade = score['score']
+    print(f"Score: {score}")
+    try:
+        grade = score["score"]
+    except (KeyError, TypeError, ValueError) as e:
+        print("Error parsing score:", score)
+        grade = "yes"
+    #when web search is used, the score is either non existant or empty
+    if grade == "":
+        grade = "yes"
+    # grade = score['score']
 
     # Check hallucination
     if grade == "yes":
@@ -301,6 +369,7 @@ def grade_generation_v_documents_and_question(state):
 def build_graph():
     workflow = StateGraph(GraphState)
     
+    workflow.add_node("select_headers", select_headers)
     workflow.add_node("websearch", web_search)
     workflow.add_node("retrieve", retrieve)
     workflow.add_node("grade_documents", grade_documents)
@@ -310,10 +379,11 @@ def build_graph():
         route_question,
         {
             "websearch": "websearch",
-            "vectorstore": "retrieve",
+            "vectorstore": "select_headers",
         },
     )
 
+    workflow.add_edge("select_headers", "retrieve")
     workflow.add_edge("retrieve", "grade_documents")
     workflow.add_conditional_edges(
         "grade_documents",
@@ -336,15 +406,41 @@ def build_graph():
 
     return workflow.compile()
 
-def check_collection():
-    """
-    Check if the collection exists in the vector database.
-    """
-    from pymilvus import MilvusClient
+### --- BUILDER FUNCTION ---######################################################################################
+# def build_graph():
+#     workflow = StateGraph(GraphState)
+    
+#     workflow.add_node("websearch", web_search)
+#     workflow.add_node("retrieve", retrieve)
+#     workflow.add_node("grade_documents", grade_documents)
+#     workflow.add_node("generate", generate)
 
-    client = MilvusClient("milvus_db.db")
+#     workflow.set_conditional_entry_point(
+#         route_question,
+#         {
+#             "websearch": "websearch",
+#             "vectorstore": "retrieve",
+#         },
+#     )
 
-    if client.has_collection(collection_name="hybrid_collection"):
-        print("Collection exists")
-    else:
-        print("no collection")
+#     workflow.add_edge("retrieve", "grade_documents")
+#     workflow.add_conditional_edges(
+#         "grade_documents",
+#         decide_to_generate,
+#         {
+#             "websearch": "websearch",
+#             "generate": "generate",
+#         },
+#     )
+#     workflow.add_edge("websearch", "generate")
+#     workflow.add_conditional_edges(
+#         "generate",
+#         grade_generation_v_documents_and_question,
+#         {
+#             "not supported": "generate",
+#             "useful": END,
+#             "not useful": "websearch",
+#         },
+#     )
+
+#     return workflow.compile()
