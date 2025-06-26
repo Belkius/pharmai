@@ -41,7 +41,7 @@ def extract_categories(opakowanie: Union[str, float]) -> str:
     categories = ["OTC", "Rp", "Rpz", "Rpw", "Lz"]
     pattern = r'\b(?:' + '|'.join(map(re.escape, categories)) + r')\b'
 
-    matches = re.findall(pattern, opakowanie)
+    matches = re.findall(pattern, str(opakowanie))
     if matches:
         return ", ".join(sorted(set(matches)))
     return ""
@@ -62,10 +62,8 @@ def process_and_save_categories(
         id_col (str): The name of the identifier column.
         output_filename (str): The name of the output CSV file.
     """
-    # Create new column with extracted categories
     df["Kategorie dostępności"] = df[opakowanie_col].apply(extract_categories)
 
-    # Save to CSV
     df[[id_col, "Kategorie dostępności"]].to_csv(
         output_filename, sep=';', quotechar='"', index=False
     )
@@ -81,17 +79,13 @@ def extract_human_medicines_with_characteristics(df: pd.DataFrame) -> pd.DataFra
     Returns:
         pd.DataFrame: A cleaned DataFrame with 'Product Identifier' and 'Characteristics' columns.
     """
-    # Filter rows where 'Type of preparation' is 'Human'
     df_human = df[df['Rodzaj preparatu'] == 'Ludzki']
 
-    # Remove rows without availability categories
     missing_category_indices = [index for index, row in df_human.iterrows() if not row["Kategorie dostępności"]]
     df_filtered = df_human.drop(missing_category_indices)
 
-    # Select only the necessary columns
     df_filtered = df_filtered[['Identyfikator Produktu Leczniczego', 'Charakterystyka']]
 
-    # Remove rows with empty 'Characteristics'
     df_filtered = df_filtered.dropna(subset=['Charakterystyka'])
 
     return df_filtered
@@ -143,7 +137,6 @@ def download_pdfs_from_dataframe(df: pd.DataFrame,
         output_dir (str): Directory to save the downloaded PDFs.
         delay (int): Delay in seconds between downloads to avoid API rate limits.
     """
-    # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
 
     pdf_links = df[url_column]
@@ -154,7 +147,6 @@ def download_pdfs_from_dataframe(df: pd.DataFrame,
             id_number = df.iloc[i][id_column]
             filename = os.path.join(output_dir, f"char_{id_number}.pdf")
 
-            # Skip if already downloaded
             if os.path.exists(filename):
                 continue
 
@@ -164,7 +156,6 @@ def download_pdfs_from_dataframe(df: pd.DataFrame,
 
             save_pdf(pdf_content, filename)
 
-            # Delay between requests
             time.sleep(delay)
 
         except Exception as e:
@@ -181,7 +172,6 @@ def convert_pdfs_to_markdown(pdf_dir: str, md_dir: str) -> None:
         pdf_dir (str): Directory containing input PDF files.
         md_dir (str): Directory where Markdown files will be saved.
     """
-    # Ensure that the output directory exists
     if not os.path.exists(md_dir):
         os.makedirs(md_dir)
 
@@ -196,7 +186,7 @@ def convert_pdfs_to_markdown(pdf_dir: str, md_dir: str) -> None:
             md_path = os.path.join(md_dir, md_filename)
 
             if os.path.exists(md_path):
-                continue  # Skip if already converted
+                continue  
 
             converter = DocumentConverter()
             doc = converter.convert(pdf_path)

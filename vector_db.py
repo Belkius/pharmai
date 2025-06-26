@@ -1,6 +1,9 @@
 import os
+import re
+import time
+from pathlib import Path
 from typing import List
-from pymilvus import MilvusClient
+from pymilvus import MilvusClient, DataType, utility
 from pymilvus import AnnSearchRequest
 from pymilvus import RRFRanker
 
@@ -9,11 +12,121 @@ from pymilvus.model.hybrid import MGTEEmbeddingFunction
 # client = MilvusClient(host="localhost", port=1953, timeout=10)
 client = MilvusClient("milvus_db.db")
 
+def initialize_milvus_collection(client, collection_name="CHPL_collection"):
+    if client.has_collection(collection_name):
+        print(f"Collection '{collection_name}' already exists.")
+        return
+
+    schema = client.create_schema()
+    schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True, auto_id=False)
+    schema.add_field(field_name="text", datatype=DataType.VARCHAR, max_length=65535)
+    schema.add_field(field_name="dense_vector", datatype=DataType.FLOAT_VECTOR, dim=768)
+    schema.add_field(field_name="sparse_vector", datatype=DataType.SPARSE_FLOAT_VECTOR)
+    schema.add_field(field_name="availability_categories", datatype=DataType.ARRAY, element_type=DataType.VARCHAR, max_length=20, max_capacity=5)
+
+    index_params = client.prepare_index_params()
+    index_params.add_index(field_name="dense_vector", index_type="FLAT", metric_type="COSINE", index_name="dense_index")
+    index_params.add_index(field_name="sparse_vector", index_type="SPARSE_INVERTED_INDEX", metric_type="IP", index_name="sparse_index")
+
+    client.create_collection(collection_name=collection_name, schema=schema, index_params=index_params)
+    print(f"Collection '{collection_name}' created successfully.")
+
+def get_existing_ids(client, collection_name):
+    results = client.query(
+        collection_name=collection_name,
+        filter="id >= 0",
+        output_fields=["id"]
+    )
+    existing_ids = {res["id"] for res in results}
+    return existing_ids
+
+def extract_categories_and_text(file_path, df_cat):
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    id_match = re.search(r'char_(\d+)', file_path.name)
+    if not id_match:
+        raise ValueError(f"ID not found in file name: {file_path.name}")
+
+    id_value = int(id_match.group(1))
+
+    raw_categories = df_cat.loc[df_cat["Identyfikator Produktu Leczniczego"] == id_value]["Kategorie dostępności"]
+    if raw_categories.empty:
+        categories = []
+    else:
+        raw_categories = raw_categories.values[0]
+        if isinstance(raw_categories, str):
+            categories = [cat.strip() for cat in raw_categories.split(",")]
+        else:
+            categories = []
+
+    return categories, content, id_value
+
 mgte_ef = MGTEEmbeddingFunction(
     model_name="Alibaba-NLP/gte-multilingual-base",
 )
 
-def query_hybrid_search(query: str, limit: int = 2):
+def prepare_data_for_insertion(file_paths, df_cat, existing_ids):
+    all_texts = []
+    all_categories = []
+    all_ids = []
+
+    for file_path in file_paths:
+        categories, text, id_value = extract_categories_and_text(file_path, df_cat)
+        if id_value in existing_ids:
+            continue
+        all_texts.append(text)
+        all_categories.append(categories)
+        all_ids.append(id_value)
+
+    if not all_texts:
+        print("No new data to insert.")
+        return []
+
+    vectors = mgte_ef.encode_documents(all_texts)
+
+    data = []
+    for idx, text in enumerate(all_texts):
+        indices = vectors['sparse'][idx].col.tolist()
+        values = vectors['sparse'][idx].data.tolist()
+        sparse_vector_data = list(zip(indices, values))
+
+        entry = {
+            "id": all_ids[idx],
+            "text": text,
+            "dense_vector": vectors['dense'][idx].tolist(),
+            "sparse_vector": sparse_vector_data,
+            "availability_categories": all_categories[idx]
+        }
+        data.append(entry)
+
+    return data
+
+def insert_data(client, collection_name, data):
+    if data:
+        client.insert(collection_name=collection_name, data=data)
+        print("Data inserted successfully into Milvus.")
+    else:
+        print("No data to insert.")
+
+def process_in_batches(client, file_paths, df_cat, collection_name="CHPL_collection", batch_size=40, pause_time=20):
+    existing_ids = get_existing_ids(client, collection_name)
+    for i in range(0, len(file_paths), batch_size):
+        batch_files = file_paths[i:i+batch_size]
+        print(f"\nProcessing batch {i//batch_size + 1}: {len(batch_files)} files")
+
+        data = prepare_data_for_insertion(batch_files, df_cat, existing_ids)
+        if data:
+            insert_data(client, collection_name, data)
+            existing_ids.update(entry["id"] for entry in data)
+        else:
+            print("No new data to insert in this batch.")
+            continue
+
+        print(f"Waiting {pause_time} seconds before next batch...")
+        time.sleep(pause_time)
+
+def query_hybrid_search(query: str, limit: int = 2, collection_name="CHPL_collection"):
     query_embeddings = mgte_ef([query])
 
     sparse_req = AnnSearchRequest(
@@ -24,17 +137,17 @@ def query_hybrid_search(query: str, limit: int = 2):
     )
 
     result = client.hybrid_search(
-        collection_name="hybrid_collection", reqs=[sparse_req, dense_req], ranker=RRFRanker(), limit=limit, output_fields=["text"]
+        collection_name=collection_name, reqs=[sparse_req, dense_req], ranker=RRFRanker(), limit=limit, output_fields=["text"]
     )
 
     return result
 
-def query_dense_search(query: str, limit: int = 2):
+def query_dense_search(query: str, limit: int = 2, collection_name="CHPL_collection"):
     query_embeddings = mgte_ef([query])
     dense_vec = query_embeddings['dense'][0].tolist()
 
     search_params = {
-        "collection_name": "hybrid_collection",
+        "collection_name": collection_name,
         "data": [dense_vec],
         "anns_field": "dense_vector",
         "params":{},
@@ -78,54 +191,75 @@ def load_texts_from_ids(ids, directory="charakterystyki_md"):
             with open(filename, "r", encoding="utf-8") as file:
                 content_dict[id_] = file.read()
         except FileNotFoundError:
-            content_dict[id_] = None  # or handle as appropriate
+            content_dict[id_] = None
     return content_dict
+
+from typing import List
+
+import re
+from typing import List
 
 def headers_extraction(document_text: str, relevant_headers: List[str]) -> List[str]:
     """
-    Extract sections of the document that match the relevant headers.
+    Extract sections of the document that match relevant headers,
+    using the known order of all headers to find section boundaries.
 
     Args:
         document_text (str): Full document text to parse.
-        relevant_headers (List[str]): List of header strings to match.
+        relevant_headers (List[str]): List of relevant headers to match.
 
     Returns:
-        List[str]: Filtered document sections corresponding to relevant headers.
+        List[str]: List of matched document sections.
     """
-    MUST_INCLUDE_HEADER = "NAZWA PRODUKTU LECZNICZEGO"
-    headers_to_check = set(h.lower() for h in relevant_headers)
-    headers_to_check.add(MUST_INCLUDE_HEADER.lower())
+    ordered_headers = [
+        "NAZWA PRODUKTU LECZNICZEGO",
+        "SKŁAD JAKOŚCIOWY I ILOŚCIOWY",
+        "POSTAĆ FARMACEUTYCZNA",
+        "SZCZEGÓŁOWE DANE KLINICZNE",
+        "WŁAŚCIWOŚCI FARMAKOLOGICZNE",
+        "DANE FARMACEUTYCZNE",
+        "PODMIOT ODPOWIEDZIALNY POSIADAJĄCY POZWOLENIE NA DOPUSZCZENIE DO OBROTU",
+        "NUMER POZWOLENIA NA DOPUSZCZENIE DO OBROTU",
+        "DATA WYDANIA PIERWSZEGO POZWOLENIA NA DOPUSZCZENIE DO OBROTU I DATA PRZEDŁUŻENIA POZWOLENIA",
+        "DATA ZATWIERDZENIA LUB CZĘŚCIOWEJ ZMIANY TEKSTU CHARAKTERYSTYKI PRODUKTU LECZNICZEGO"
+    ]
 
-    doc_sections = document_text.split('\n')
-    filtered_sections = []
-    current_header = None
-    current_content = []
+    relevant_headers_lower = set(h.lower() for h in relevant_headers)
+    name_header_lower = ordered_headers[0].lower()
 
-    for line in doc_sections:
-        line_stripped = line.strip()
-        if any(h.lower() in line_stripped.lower() for h in relevant_headers):
-            # Save previous matching section
-            if current_header and current_header in relevant_headers and current_content:
-                filtered_sections.append(f"{current_header}\n" + "\n".join(current_content))
-            current_header = line_stripped
-            current_content = []
-        elif current_header:
-            current_content.append(line_stripped)
+    relevant_headers_lower.add(name_header_lower)
 
-    if current_header and current_header in relevant_headers and current_content:
-        filtered_sections.append(f"{current_header}\n" + "\n".join(current_content))
+    header_pattern = re.compile(r'^#+\s*(\d+\.)?\s*(.+)', re.IGNORECASE)
 
-    return filtered_sections
+    lines = document_text.splitlines()
+    sections = []
+    current_section = None
 
-def check_collection():
+    header_indices = []
+    for i, line in enumerate(lines):
+        match = header_pattern.match(line.strip())
+        if match:
+            header_text = match.group(2).strip().lower()
+            for ordered_header in ordered_headers:
+                if ordered_header.lower() in header_text:
+                    header_indices.append((i, ordered_header))
+                    break
+
+    for idx, (start_idx, header_text) in enumerate(header_indices):
+        end_idx = header_indices[idx + 1][0] if idx + 1 < len(header_indices) else len(lines)
+        if header_text.lower() in relevant_headers_lower:
+            content = "\n".join(lines[start_idx:end_idx]).strip()
+            sections.append(content)
+
+    return sections
+
+
+def check_collection(client=client, collection_name="CHPL_collection"):
     """
     Check if the collection exists in the vector database.
     """
-    from pymilvus import MilvusClient
 
-    client = MilvusClient("milvus_db.db")
-
-    if client.has_collection(collection_name="hybrid_collection"):
+    if client.has_collection(collection_name=collection_name):
         print("Collection exists")
     else:
         print("no collection")

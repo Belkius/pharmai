@@ -5,8 +5,12 @@ from langgraph.graph import StateGraph, END
 from langchain.schema import Document
 from typing_extensions import TypedDict
 from typing import List
+import json
+from google import genai
+from google.genai import types
+from langchain_google_genai import ChatGoogleGenerativeAI
 
-# Import local vector DB utils
+
 from vector_db import query_hybrid_search, extract_ids, load_texts_from_ids, headers_extraction
 from langchain_community.tools import DuckDuckGoSearchResults
 
@@ -16,13 +20,38 @@ class GraphState(TypedDict):
     generation: str
     web_search: str
     documents: List[str]
+    relevant_headers: List[str]
+
 
 ### --- MODEL INIT ---
-def get_llm():
-    return ChatOllama(
-        model='hf.co/unsloth/gemma-3-4b-it-GGUF:Q4_K_M',
-        format="json"
-    )
+model_type = 'google'  # 'local' or 'google'
+
+def get_llm(model_type: str = 'local'):
+    """
+    Returns a language model instance based on the specified model_type.
+
+    Parameters:
+    - model_type (str): Type of the model to use. Options are 'local' or 'google'.
+
+    Returns:
+    - An instance of the selected language model.
+    """
+    if model_type == 'local':
+        return ChatOllama(
+            model='hf.co/unsloth/gemma-3-4b-it-GGUF:Q4_K_M',
+            format="json"
+        )
+    elif model_type == 'google':
+        with open('secrets.json') as f:
+            secrets = json.load(f)
+            GOOGLE_API_KEY = secrets['GOOGLE_API_KEY']
+        return ChatGoogleGenerativeAI(
+            model="gemini-2.0-flash",
+            google_api_key=GOOGLE_API_KEY
+        )
+    else:
+        raise ValueError(f"Unsupported model_type: {model_type}")
+
 
 ### --- TOOL ---
 # web_search_tool = DuckDuckGoSearchResults(region="pl-pl", max_results=3)
@@ -31,16 +60,15 @@ web_search_tool = DuckDuckGoSearchResults()
 headers = """NAZWA PRODUKTU LECZNICZEGO, SKŁAD JAKOŚCIOWY I ILOŚCIOWY, POSTAĆ FARMACEUTYCZNA, SZCZEGÓŁOWE DANE KLINICZNE, WŁAŚCIWOŚCI FARMAKOLOGICZNE, DANE FARMACEUTYCZNE, PODMIOT ODPOWIEDZIALNY POSIADAJĄCY POZWOLENIE NA DOPUSZCZENIE DO OBROTU, NUMER POZWOLENIA NA DOPUSZCZENIE DO OBROTU, DATA WYDANIA PIERWSZEGO POZWOLENIA NA DOPUSZCZENIE DO OBROTU I DATA PRZEDŁUŻENIA POZWOLENIA, DATA ZATWIERDZENIA LUB CZĘŚCIOWEJ ZMIANY TEKSTU CHARAKTERYSTYKI PRODUKTU LECZNICZEGO"""
 
 
-### --- CHAINS ---
-llm = get_llm()
+# ### --- CHAINS ---
+llm = get_llm(model_type=model_type)
 retrieval_grader = PromptTemplate(
     template = """
+    RETURN ONLY JSON OBJECT WITH A SINGLE KEY 'score' AND NO ADDITIONAL TEXT.
     You are evaluating whether a retrieved document is relevant to a user question.
     If the document contains keywords or concepts related to the question, consider it relevant. 
-    This is a lenient filter meant to exclude clearly unrelated results.
-    Return a binary relevance score: 'yes' if relevant, 'no' if not.
-    Output only a JSON object with a single key 'score' and no additional text.
-
+    Example output: {{"score": "yes"}} or {{"score": "no"}}
+    
     Retrieved document:
     {document}
 
@@ -69,8 +97,9 @@ header_selector = PromptTemplate(
 
 rag_chain = PromptTemplate(
     template="""
+    Always answer in Polish.
     You are an assistant specialized in answering questions about medicinal products.
-    Use the provided context to answer the question. If the answer is not found in the context, respond with "Unfortunatly, I don't know."
+    Use the provided context to answer the question. If the answer is not found in the context, respond with "Niestety nie wiem."
     Keep your response quick and concise.
 
     Question: {question}  
@@ -125,7 +154,6 @@ question_router = PromptTemplate(
 ) | llm | JsonOutputParser()
 
 ### --- NODE FUNCTIONS ---
-## Nodes
 def retrieve(state):
     """
     Retrieve documents from vectorstore
@@ -139,13 +167,10 @@ def retrieve(state):
     print("---RETRIEVE---")
     question = state["question"]
     relevant_headers = state.get("relevant_headers", [])
-
-    # Retrieval
-    docs = load_texts_from_ids(extract_ids(query_hybrid_search(question)))
+    print(state.get("relevant_headers"))
+    docs = load_texts_from_ids(extract_ids(query_hybrid_search(question, limit=3)))
     doc_txt = docs[next(iter(docs))]
-
     filtered_docs = headers_extraction(doc_txt, relevant_headers)
-
     if not filtered_docs:
         print("---WARNING: No sections matched headers. Using fallback excerpt.---")
         fallback = '\n'.join(doc_txt.split('\n')[:len(doc_txt.split('\n'))//5])
@@ -153,11 +178,6 @@ def retrieve(state):
     else:
         documents = ['\n'.join(filtered_docs)]
     print(f"Filtered documents: {documents}")
-
-    # without headers splitting
-    # doc_txt = doc_txt.split('\n')
-    # documents = '\n'.join(doc_txt[:len(doc_txt)//5])
-    # documents = [documents]
 
     return {"documents": documents, "question": question}
 
@@ -175,7 +195,6 @@ def generate(state):
     question = state["question"]
     documents = state["documents"]
     
-    # RAG generation
     generation = rag_chain.invoke({"context": documents, "question": question})
     return {"documents": documents, "question": question, "generation": generation}
 
@@ -211,30 +230,25 @@ def grade_documents(state):
     print("---CHECK DOCUMENT RELEVANCE TO QUESTION---")
     question = state["question"]
     documents = state["documents"]
-    
-    # Score each doc
     filtered_docs = []
     web_search = "No"
 
     for d in documents:
         score = retrieval_grader.invoke({"question": question, "document": d})
         grade = score['score']
-        # Document relevant
+
         if grade.lower() == "yes":
             print("---GRADE: DOCUMENT RELEVANT---")
             filtered_docs.append(d)
-        # Document not relevant
         else:
             print("---GRADE: DOCUMENT NOT RELEVANT---")
-            # We do not include the document in filtered_docs
-            # We set a flag to indicate that we want to run web search
             web_search = "Yes"
             continue
     return {"documents": filtered_docs, "question": question, "web_search": web_search}
 
 def web_search(state):
     """
-    Web search based based on the question
+    Web search based on the question
 
     Args:
         state (dict): The current graph state
@@ -246,8 +260,7 @@ def web_search(state):
     print("---WEB SEARCH---")
     question = state["question"]
     documents = state.get("documents", [])
-
-    # Web search
+    return {"documents": '', "question": question}
     docs = web_search_tool.invoke({"query": question})
     web_results = "\n".join(docs)
     web_results = Document(page_content=web_results)
@@ -255,7 +268,7 @@ def web_search(state):
         documents.append(web_results)
     else:
         documents = [web_results]
-    documents = documents[:3]  # Limit to 3 documents
+    documents = documents[:3] 
     return {"documents": documents, "question": question}
 
 def route_question(state):
@@ -272,12 +285,8 @@ def route_question(state):
     print("---ROUTE QUESTION---")
     question = state["question"]
     print(question)
-    # answer = rag_chain.invoke({"context": 'brak kontekstu', "question": question})
-    # print(answer)
-    # return END
     source = question_router.invoke({"question": question})  
     print(source)
-    print(source['datasource'])
 
     if source['datasource'] == 'web_search':
         print("---ROUTE QUESTION TO WEB SEARCH---")
@@ -306,12 +315,9 @@ def decide_to_generate(state):
     filtered_documents = state["documents"]
 
     if web_search == "Yes":
-        # All documents have been filtered check_relevance
-        # We will re-generate a new query
         print("---DECISION: ALL DOCUMENTS ARE NOT RELEVANT TO QUESTION, INCLUDE WEB SEARCH---")
         return "websearch"
     else:
-        # We have relevant documents, so generate answer
         print("---DECISION: GENERATE---")
         return "generate"
     
@@ -334,24 +340,20 @@ def grade_generation_v_documents_and_question(state):
     
     score = hallucination_grader.invoke({"documents": documents, "generation": generation})
     print(f"Score: {score}")
+    
     try:
         grade = score["score"]
     except (KeyError, TypeError, ValueError) as e:
         print("Error parsing score:", score)
-        grade = "yes"
-    #when web search is used, the score is either non existant or empty
     if grade != "yes" and grade != "no":
         print("Error parsing score:", score)
-        grade = "yes"
-    # grade = score['score']
 
-    # Check hallucination
     if grade == "yes":
         print("---DECISION: GENERATION IS GROUNDED IN DOCUMENTS---")
-        # Check question-answering
         print("---GRADE GENERATION vs QUESTION---")
         score = answer_grader.invoke({"question": question,"generation": generation})
         grade = score['score']
+        
         if grade == "yes":
             print("---DECISION: GENERATION ADDRESSES QUESTION---")
             return "useful"
@@ -362,9 +364,6 @@ def grade_generation_v_documents_and_question(state):
         print("---DECISION: GENERATION IS NOT GROUNDED IN DOCUMENTS, RE-TRY---")
         return "not supported"
 
-# Example update inside the functions:
-# In generate():
-# generation = rag_chain.invoke(...)  ← this rag_chain must refer to the one above
 
 ### --- BUILDER FUNCTION ---
 def build_graph():
@@ -406,42 +405,3 @@ def build_graph():
     )
 
     return workflow.compile()
-
-### --- BUILDER FUNCTION ---######################################################################################
-# def build_graph():
-#     workflow = StateGraph(GraphState)
-    
-#     workflow.add_node("websearch", web_search)
-#     workflow.add_node("retrieve", retrieve)
-#     workflow.add_node("grade_documents", grade_documents)
-#     workflow.add_node("generate", generate)
-
-#     workflow.set_conditional_entry_point(
-#         route_question,
-#         {
-#             "websearch": "websearch",
-#             "vectorstore": "retrieve",
-#         },
-#     )
-
-#     workflow.add_edge("retrieve", "grade_documents")
-#     workflow.add_conditional_edges(
-#         "grade_documents",
-#         decide_to_generate,
-#         {
-#             "websearch": "websearch",
-#             "generate": "generate",
-#         },
-#     )
-#     workflow.add_edge("websearch", "generate")
-#     workflow.add_conditional_edges(
-#         "generate",
-#         grade_generation_v_documents_and_question,
-#         {
-#             "not supported": "generate",
-#             "useful": END,
-#             "not useful": "websearch",
-#         },
-#     )
-
-#     return workflow.compile()
