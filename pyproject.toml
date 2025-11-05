@@ -1,0 +1,31 @@
+[project]
+name = "pharmai"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "chainlit>=2.5.5",
+    "cmake>=4.0.0",
+    "docling>=2.15.1",
+    "duckduckgo-search>=8.0.1",
+    "google-genai>=1.9.0",
+    "graphviz>=0.20.3",
+    "langchain>=0.3.24",
+    "langchain-community>=0.3.23",
+    "langchain-google-genai>=2.1.4",
+    "langchain-ollama>=0.3.2",
+    "langgraph>=0.4.1",
+    "matplotlib>=3.10.3",
+    "numpy>=2.2.4",
+    "ollama>=0.4.8",
+    "pandas>=2.2.3",
+    "pip>=25.0.1",
+    "pymilvus[model]>=2.5.6",
+    "requests>=2.32.3",
+    "ruff>=0.11.2",
+    "scikit-learn>=1.6.1",
+    "seaborn>=0.13.2",
+    "sentence-transformers>=4.0.2",
+    "tqdm>=4.67.1",
+]
